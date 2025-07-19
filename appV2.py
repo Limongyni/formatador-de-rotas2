@@ -1,16 +1,10 @@
 import streamlit as st
 import pandas as pd
+import requests
+import pdfplumber
 import io
-
-# --- Configuração da Página do App ---
-st.set_page_config(
-    page_title="Formatador de Rotas",
-    page_icon="🚚",
-    layout="centered"
-)
-
-st.title("🚚 Formatador de Rotas para Circuit")
-st.write("Faça o upload da sua planilha Excel para agrupar e formatar os pacotes por parada.")
+import re
+import os
 
 # --- Funções auxiliares ---
 def formatar_cep(cep):
@@ -21,98 +15,138 @@ def limpar_float_texto(valor):
     valor_str = str(valor)
     return valor_str.replace('.0', '') if valor_str.endswith('.0') else valor_str
 
-# --- Função principal ---
-def processar_arquivo_excel(arquivo_bytes):
+def buscar_endereco_por_cep(cep):
+    cep = ''.join(filter(str.isdigit, str(cep)))
+    if len(cep) != 8:
+        return {'logradouro': '', 'bairro': '', 'localidade': ''}
     try:
-        df = pd.read_excel(arquivo_bytes)
+        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/")
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                'logradouro': data.get('logradouro', ''),
+                'bairro': data.get('bairro', ''),
+                'localidade': data.get('localidade', '')
+            }
     except Exception as e:
-        st.error(f"❌ Erro ao ler o arquivo Excel: {e}")
-        return None
+        st.error(f"Erro ao consultar CEP {cep}: {e}")
+    return {'logradouro': '', 'bairro': '', 'localidade': ''}
 
-    mapa_colunas = {
-        'N.º': 'Parada', 'ID do pacote': 'ID do Pacote', 'Endereço': 'Endereco',
-        'N.º.1': 'Numero', 'Bairro': 'Bairro', 'Cidade': 'Cidade', 'CEP': 'CEP'
-    }
-    df.rename(columns=mapa_colunas, inplace=True)
+def extrair_tabela_pdf(arquivo_pdf):
+    dados = []
+    with pdfplumber.open(arquivo_pdf) as pdf:
+        for pagina in pdf.pages:
+            tabela = pagina.extract_table()
+            if tabela:
+                for linha in tabela[1:]:
+                    if any(linha):
+                        dados.append(linha)
+    colunas = ['Parada', 'ID do Pacote', 'Cliente', 'Endereco', 'Numero', 'Complemento', 'Bairro', 'Cidade', 'CEP', 'Tipo', 'Assinatura']
+    df = pd.DataFrame(dados, columns=colunas[:len(dados[0])])
+    return df
 
-    colunas_essenciais = ['Parada', 'ID do Pacote', 'Endereco', 'Numero', 'Bairro', 'CEP']
-    if not all(col in df.columns for col in colunas_essenciais):
-        st.error("⚠️ Colunas esperadas não encontradas. Verifique o nome das colunas no seu arquivo original.")
-        return None
-
-    # Limpeza e formatação
+def processar_dataframe(df):
     for col in ['Numero', 'CEP', 'ID do Pacote', 'Parada']:
         if col in df.columns:
             df[col] = df[col].apply(limpar_float_texto)
 
-    df['Address Line'] = df['Endereco'].astype(str).str.strip() + ', ' + df['Numero'].astype(str).str.strip()
     df['CEP'] = df['CEP'].apply(formatar_cep)
 
+    enderecos = df['CEP'].apply(buscar_endereco_por_cep)
+    df['Endereco'] = enderecos.apply(lambda x: x['logradouro'])
+    df['Bairro'] = enderecos.apply(lambda x: x['bairro'])
+    df['Cidade'] = enderecos.apply(lambda x: x['localidade'])
+
+    df['Address Line'] = df['Endereco'].astype(str).str.strip() + ', ' + df['Numero'].astype(str).str.strip()
+
     df_formatado = pd.DataFrame({
-        'Parada': df['Parada'], 'ID do Pacote': df['ID do Pacote'], 'Address Line': df['Address Line'],
-        'Secondary Address Line': df['Bairro'], 'City': df.get('Cidade', 'São José dos Campos'),
-        'State': 'São Paulo', 'Zip Code': df['CEP']
+        'Parada': df['Parada'],
+        'ID do Pacote': df['ID do Pacote'],
+        'Address Line': df['Address Line'],
+        'Complemento': df.get('Complemento', ''),
+        'Secondary Address Line': df['Bairro'],
+        'City': df['Cidade'],
+        'State': 'São Paulo',
+        'Zip Code': df['CEP']
     })
 
-    # Agrupamento por número base
     df_formatado['Parada_Base'] = df_formatado['Parada'].astype(str).str.extract(r'(\d+)')
-    
-    linhas_invalidas = df_formatado['Parada_Base'].isnull()
-    if linhas_invalidas.any():
-        st.warning(f"Atenção: {linhas_invalidas.sum()} linha(s) foram ignoradas por não terem um número de parada válido.")
-        df_formatado.dropna(subset=['Parada_Base'], inplace=True)
-
-    if df_formatado.empty:
-        st.error("Nenhuma linha válida encontrada para processar após a limpeza.")
-        return None
-        
+    df_formatado.dropna(subset=['Parada_Base'], inplace=True)
     df_formatado['Parada_Base'] = df_formatado['Parada_Base'].astype(int)
 
     df_agrupado = df_formatado.groupby('Parada_Base').agg({
         'ID do Pacote': lambda x: ', '.join(x.astype(str)),
         'Address Line': 'first',
+        'Complemento': 'first',
         'Secondary Address Line': 'first',
         'City': 'first',
         'State': 'first',
         'Zip Code': 'first'
     }).reset_index()
 
-    # Formatando colunas conforme solicitado
-    df_agrupado['Total de Pacotes'] = df_agrupado['ID do Pacote'].str.split(',').str.len().astype(int)
+    df_agrupado['Total de Pacotes'] = df_agrupado['ID do Pacote'].str.split(',').str.len()
     df_agrupado['Total de Pacotes'] = df_agrupado['Total de Pacotes'].apply(
         lambda x: f"{x} pacote" if x == 1 else f"{x} pacotes"
     )
-    df_agrupado.rename(columns={'Parada_Base': 'Parada_Num'}, inplace=True)
-    df_agrupado['Parada'] = df_agrupado['Parada_Num'].apply(lambda x: f"Parada {x}")
+    df_agrupado['Parada'] = df_agrupado['Parada_Base'].apply(lambda x: f"Parada {x}")
 
-    colunas_finais = ['Parada', 'ID do Pacote', 'Total de Pacotes', 'Address Line', 'Secondary Address Line', 'City', 'State', 'Zip Code']
+    colunas_finais = [
+        'Parada',
+        'ID do Pacote',
+        'Total de Pacotes',
+        'Address Line',
+        'Complemento',
+        'Secondary Address Line',
+        'City',
+        'State',
+        'Zip Code'
+    ]
+
     return df_agrupado[colunas_finais]
 
-# --- Interface do App ---
-uploaded_file = st.file_uploader(
-    "Escolha o arquivo Excel da rota (.xlsx)",
-    type="xlsx"
-)
+# --- App Streamlit ---
+st.set_page_config(page_title="Formatador de Rota", layout="centered")
 
-if uploaded_file is not None:
-    st.info("🔄 Processando o arquivo... Aguarde.")
-    
-    df_final = processar_arquivo_excel(uploaded_file)
-    
-    if df_final is not None:
-        st.success("✅ Arquivo processado com sucesso!")
+st.title("📦 Formatador de Rota com Agrupamento")
+st.write("Envie um arquivo `.pdf` ou `.xlsx` para extrair, formatar e salvar a rota agrupada.")
+
+arquivo = st.file_uploader("Selecione o arquivo de rota", type=["pdf", "xlsx"])
+
+if arquivo:
+    nome_base = os.path.splitext(arquivo.name)[0]
+    st.success(f"Arquivo carregado: {arquivo.name}")
+
+    if arquivo.name.endswith(".pdf"):
+        st.info("🔍 Extraindo dados do PDF...")
+        df_raw = extrair_tabela_pdf(arquivo)
+    elif arquivo.name.endswith(".xlsx"):
+        st.info("📖 Lendo planilha Excel...")
+        df_raw = pd.read_excel(arquivo)
+        df_raw = df_raw.iloc[1:]
+        df_raw.columns = df_raw.columns.str.strip()
+    else:
+        st.error("❌ Formato de arquivo não suportado.")
+        st.stop()
+
+    st.info("⚙️ Processando dados...")
+    df_final = processar_dataframe(df_raw)
+
+    if df_final.empty:
+        st.warning("⚠️ Nenhum dado processado.")
+    else:
+        st.success("✅ Dados processados com sucesso!")
         st.dataframe(df_final)
 
-        # Criar arquivo Excel em memória
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df_final.to_excel(writer, index=False, sheet_name='RotaFormatada')
-        excel_bytes = output.getvalue()
 
-        # Botão de download
+        buffer.seek(0)
+        nome_saida = f"{nome_base}_rota_formatada.xlsx"
         st.download_button(
-            label="⬇️ Baixar Arquivo Formatado (.xlsx)",
-            data=excel_bytes,
-            file_name="rota_formatada_agrupada.xlsx",
+            label="📥 Baixar Rota Formatada",
+            data=buffer,
+            file_name=nome_saida,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
