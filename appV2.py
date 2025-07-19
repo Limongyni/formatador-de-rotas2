@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 import pdfplumber
 import io
-import re
+import time
 import os
 
 # --- Funções auxiliares ---
@@ -15,12 +15,14 @@ def limpar_float_texto(valor):
     valor_str = str(valor)
     return valor_str.replace('.0', '') if valor_str.endswith('.0') else valor_str
 
+@st.cache_data(show_spinner=False)
 def buscar_endereco_por_cep(cep):
     cep = ''.join(filter(str.isdigit, str(cep)))
     if len(cep) != 8:
         return {'logradouro': '', 'bairro': '', 'localidade': ''}
     try:
-        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/")
+        time.sleep(0.2)  # Evita bloqueio da API
+        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/", timeout=5)
         if response.status_code == 200:
             data = response.json()
             return {
@@ -29,7 +31,7 @@ def buscar_endereco_por_cep(cep):
                 'localidade': data.get('localidade', '')
             }
     except Exception as e:
-        st.error(f"Erro ao consultar CEP {cep}: {e}")
+        st.warning(f"Erro ao consultar CEP {cep}: {e}")
     return {'logradouro': '', 'bairro': '', 'localidade': ''}
 
 def extrair_tabela_pdf(arquivo_pdf):
@@ -52,10 +54,21 @@ def processar_dataframe(df):
 
     df['CEP'] = df['CEP'].apply(formatar_cep)
 
-    enderecos = df['CEP'].apply(buscar_endereco_por_cep)
-    df['Endereco'] = enderecos.apply(lambda x: x['logradouro'])
-    df['Bairro'] = enderecos.apply(lambda x: x['bairro'])
-    df['Cidade'] = enderecos.apply(lambda x: x['localidade'])
+    # CEPs únicos
+    ceps_unicos = df['CEP'].dropna().unique()
+    total = len(ceps_unicos)
+    st.info(f"🔎 Consultando endereços para {total} CEP(s) único(s)...")
+
+    # Consulta com progresso
+    enderecos_dict = {}
+    progress = st.progress(0)
+    for i, cep in enumerate(ceps_unicos):
+        enderecos_dict[cep] = buscar_endereco_por_cep(cep)
+        progress.progress((i + 1) / total)
+
+    df['Endereco'] = df['CEP'].apply(lambda c: enderecos_dict.get(c, {}).get('logradouro', ''))
+    df['Bairro'] = df['CEP'].apply(lambda c: enderecos_dict.get(c, {}).get('bairro', ''))
+    df['Cidade'] = df['CEP'].apply(lambda c: enderecos_dict.get(c, {}).get('localidade', ''))
 
     df['Address Line'] = df['Endereco'].astype(str).str.strip() + ', ' + df['Numero'].astype(str).str.strip()
 
@@ -108,13 +121,13 @@ def processar_dataframe(df):
 st.set_page_config(page_title="Formatador de Rota", layout="centered")
 
 st.title("📦 Formatador de Rota com Agrupamento")
-st.write("Envie um arquivo `.pdf` ou `.xlsx` para extrair, formatar e salvar a rota agrupada.")
+st.write("Envie um arquivo `.pdf` ou `.xlsx` com a rota, e baixe o arquivo formatado com agrupamento por parada.")
 
 arquivo = st.file_uploader("Selecione o arquivo de rota", type=["pdf", "xlsx"])
 
 if arquivo:
     nome_base = os.path.splitext(arquivo.name)[0]
-    st.success(f"Arquivo carregado: {arquivo.name}")
+    st.success(f"📁 Arquivo carregado: {arquivo.name}")
 
     if arquivo.name.endswith(".pdf"):
         st.info("🔍 Extraindo dados do PDF...")
@@ -140,8 +153,8 @@ if arquivo:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df_final.to_excel(writer, index=False, sheet_name='RotaFormatada')
-
         buffer.seek(0)
+
         nome_saida = f"{nome_base}_rota_formatada.xlsx"
         st.download_button(
             label="📥 Baixar Rota Formatada",
@@ -149,4 +162,3 @@ if arquivo:
             file_name=nome_saida,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
