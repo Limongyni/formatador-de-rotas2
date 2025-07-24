@@ -5,6 +5,15 @@ import pdfplumber
 import io
 import time
 import os
+import socket
+
+# --- Utilitário para checar se há internet ---
+def internet_disponivel():
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=2)
+        return True
+    except OSError:
+        return False
 
 # --- Funções auxiliares ---
 def formatar_cep(cep):
@@ -21,18 +30,18 @@ def buscar_endereco_por_cep(cep):
     if len(cep) != 8:
         return {'logradouro': '', 'bairro': '', 'localidade': ''}
     try:
-        time.sleep(0.2)  # Evita bloqueio da API
-        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/", timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            return {
-                'logradouro': data.get('logradouro', ''),
-                'bairro': data.get('bairro', ''),
-                'localidade': data.get('localidade', '')
-            }
-    except Exception as e:
-        st.warning(f"Erro ao consultar CEP {cep}: {e}")
-    return {'logradouro': '', 'bairro': '', 'localidade': ''}
+        time.sleep(0.2)  # evita bloqueio da API
+        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/", timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return {
+            'logradouro': data.get('logradouro', ''),
+            'bairro': data.get('bairro', ''),
+            'localidade': data.get('localidade', '')
+        }
+    except requests.exceptions.RequestException as e:
+        st.warning(f"⚠️ Erro ao consultar CEP {cep}: {e}")
+        return {'logradouro': '', 'bairro': '', 'localidade': ''}
 
 def extrair_tabela_pdf(arquivo_pdf):
     dados = []
@@ -54,17 +63,21 @@ def processar_dataframe(df):
 
     df['CEP'] = df['CEP'].apply(formatar_cep)
 
-    # CEPs únicos
     ceps_unicos = df['CEP'].dropna().unique()
     total = len(ceps_unicos)
     st.info(f"🔎 Consultando endereços para {total} CEP(s) único(s)...")
 
-    # Consulta com progresso
     enderecos_dict = {}
     progress = st.progress(0)
-    for i, cep in enumerate(ceps_unicos):
-        enderecos_dict[cep] = buscar_endereco_por_cep(cep)
-        progress.progress((i + 1) / total)
+
+    if internet_disponivel():
+        for i, cep in enumerate(ceps_unicos):
+            enderecos_dict[cep] = buscar_endereco_por_cep(cep)
+            progress.progress((i + 1) / total)
+    else:
+        st.warning("🔌 Sem conexão com a internet. Pulando consulta de CEPs.")
+        for cep in ceps_unicos:
+            enderecos_dict[cep] = {'logradouro': '', 'bairro': '', 'localidade': ''}
 
     df['Endereco'] = df['CEP'].apply(lambda c: enderecos_dict.get(c, {}).get('logradouro', ''))
     df['Bairro'] = df['CEP'].apply(lambda c: enderecos_dict.get(c, {}).get('bairro', ''))
