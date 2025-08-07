@@ -175,3 +175,4 @@ if arquivo:
             file_name=nome_saida,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
