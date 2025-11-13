@@ -24,24 +24,53 @@ def limpar_float_texto(valor):
     valor_str = str(valor)
     return valor_str.replace('.0', '') if valor_str.endswith('.0') else valor_str
 
+
+# --- Função melhorada com retry + fallback (ViaCEP → BrasilAPI) ---
 @st.cache_data(show_spinner=False)
 def buscar_endereco_por_cep(cep):
     cep = ''.join(filter(str.isdigit, str(cep)))
     if len(cep) != 8:
         return {'logradouro': '', 'bairro': '', 'localidade': ''}
+
+    url_viacep = f"https://viacep.com.br/ws/{cep}/json/"
+    url_brasilapi = f"https://brasilapi.com.br/api/cep/v2/{cep}"
+
+    # Tenta ViaCEP até 3 vezes
+    for tent in range(3):
+        try:
+            time.sleep(0.5)
+            resp = requests.get(url_viacep, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "erro" in data:
+                break  
+
+            return {
+                'logradouro': data.get('logradouro', ''),
+                'bairro': data.get('bairro', ''),
+                'localidade': data.get('localidade', '')
+            }
+
+        except requests.exceptions.RequestException:
+            time.sleep(1)
+
+    # --- Fallback automático para BrasilAPI ---
     try:
-        time.sleep(0.2)  # evita bloqueio da API
-        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/", timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        resp2 = requests.get(url_brasilapi, timeout=10)
+        resp2.raise_for_status()
+        data2 = resp2.json()
+
         return {
-            'logradouro': data.get('logradouro', ''),
-            'bairro': data.get('bairro', ''),
-            'localidade': data.get('localidade', '')
+            'logradouro': data2.get('street', ''),
+            'bairro': data2.get('neighborhood', ''),
+            'localidade': data2.get('city', '')
         }
+
     except requests.exceptions.RequestException as e:
         st.warning(f"⚠️ Erro ao consultar CEP {cep}: {e}")
         return {'logradouro': '', 'bairro': '', 'localidade': ''}
+
 
 def extrair_tabela_pdf(arquivo_pdf):
     dados = []
@@ -52,9 +81,14 @@ def extrair_tabela_pdf(arquivo_pdf):
                 for linha in tabela[1:]:
                     if any(linha):
                         dados.append(linha)
-    colunas = ['Parada', 'ID do Pacote', 'Cliente', 'Endereco', 'Numero', 'Complemento', 'Bairro', 'Cidade', 'CEP', 'Tipo', 'Assinatura']
+
+    colunas = ['Parada', 'ID do Pacote', 'Cliente', 'Endereco',
+               'Numero', 'Complemento', 'Bairro', 'Cidade',
+               'CEP', 'Tipo', 'Assinatura']
+
     df = pd.DataFrame(dados, columns=colunas[:len(dados[0])])
     return df
+
 
 def processar_dataframe(df):
     for col in ['Numero', 'CEP', 'ID do Pacote', 'Parada']:
@@ -65,8 +99,8 @@ def processar_dataframe(df):
 
     ceps_unicos = df['CEP'].dropna().unique()
     total = len(ceps_unicos)
-    st.info(f"🔎 Consultando endereços para {total} CEP(s) único(s)...")
 
+    st.info(f"🔎 Consultando endereços para {total} CEP(s) único(s)...")
     enderecos_dict = {}
     progress = st.progress(0)
 
@@ -130,6 +164,7 @@ def processar_dataframe(df):
 
     return df_agrupado[colunas_finais]
 
+
 # --- App Streamlit ---
 st.set_page_config(page_title="Formatador de Rota", layout="centered")
 
@@ -175,6 +210,3 @@ if arquivo:
             file_name=nome_saida,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-
-
